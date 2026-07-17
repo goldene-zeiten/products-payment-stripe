@@ -5,6 +5,13 @@
   "license": [
     "GPL-2.0-or-later"
   ],
+  "authors": [
+    {
+      "name": "Markus Hofmann",
+      "email": "typo3@calien.de",
+      "role": "Developer"
+    }
+  ],
   "require": {
     "php": "^8.2 || ^8.3 || ^8.4 || ^8.5",
     "ext-json": "*",
@@ -37,7 +44,9 @@
       "extension-key": "products_payment_stripe",
       "version": "1.0.0",
       "Package": {
-        "providesPackages": {}
+        "providesPackages": {
+          "stripe/stripe-php": "Resources/Private/Php/ComposerVendor"
+        }
       }
     },
     "branch-alias": {
