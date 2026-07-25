@@ -10,6 +10,7 @@ use GoldeneZeiten\Products\Core\Domain\Dto\Payment\PaymentContext;
 use GoldeneZeiten\Products\Core\Domain\Enum\PaymentResultState;
 use GoldeneZeiten\Products\Core\Domain\Enum\PaymentStatus;
 use GoldeneZeiten\Products\Core\Domain\Model\Order;
+use GoldeneZeiten\Products\Core\Domain\Repository\OrderRepository;
 use GoldeneZeiten\Products\Core\Domain\ValueObject\Money;
 use GoldeneZeiten\Products\Payment\Stripe\Client\StripeClientFactory;
 use GoldeneZeiten\Products\Payment\Stripe\Configuration\StripeConfigurationFactory;
@@ -74,6 +75,37 @@ final class StripePaymentMethodTest extends AbstractStripeMockTestCase
     }
 
     #[Test]
+    public function handleReturnDoesNotLeakTheStripeErrorMessageToTheCustomer(): void
+    {
+        $result = $this->subject()->handleReturn($this->returnRequest('cs_test_error'), $this->order());
+
+        $this->assertSame(PaymentResultState::FAILED, $result->getState());
+        $this->assertStringNotContainsString('No such checkout.session', $result->getFailureReason(), 'The raw gateway message must not reach the shopper.');
+    }
+
+    #[Test]
+    public function handleReturnRejectsAPaidSessionBoundToADifferentOrder(): void
+    {
+        $order = $this->order();
+        $order->_setProperty('uid', 999);
+
+        $result = $this->subject()->handleReturn($this->returnRequest('cs_test_1'), $order);
+
+        $this->assertSame(PaymentResultState::FAILED, $result->getState(), 'A paid session for order 42 must not settle order 999.');
+    }
+
+    #[Test]
+    public function handleReturnRejectsAPaidSessionWithATamperedAmount(): void
+    {
+        $order = $this->order();
+        $order->setTotalGross(Money::fromCents(999999));
+
+        $result = $this->subject()->handleReturn($this->returnRequest('cs_test_1'), $order);
+
+        $this->assertSame(PaymentResultState::FAILED, $result->getState(), 'A session paying less than the order total must not settle it.');
+    }
+
+    #[Test]
     public function handleReturnFailsWithoutASessionId(): void
     {
         $result = $this->subject()->handleReturn(new ServerRequest('https://shop.example/return', 'GET'), $this->order());
@@ -98,12 +130,35 @@ final class StripePaymentMethodTest extends AbstractStripeMockTestCase
         $this->assertSame(PaymentResultState::FAILED, $result->getState());
     }
 
+    #[Test]
+    public function handleStaticWebhookResolvesTheOrderFromTheSessionAndMarksItPaid(): void
+    {
+        $this->importCSVDataSet(__DIR__ . '/../Fixtures/order_for_webhook.csv');
+
+        $resolution = $this->subject()->handleStaticWebhook($this->webhookRequest(true));
+
+        $this->assertInstanceOf(Order::class, $resolution->getOrder());
+        $this->assertSame(42, $resolution->getOrder()->getUid());
+        $this->assertSame(PaymentStatus::PAID, $resolution->getResult()->getPaymentStatus());
+    }
+
+    #[Test]
+    public function handleStaticWebhookRejectsAnInvalidSignature(): void
+    {
+        $this->importCSVDataSet(__DIR__ . '/../Fixtures/order_for_webhook.csv');
+
+        $resolution = $this->subject()->handleStaticWebhook($this->webhookRequest(false));
+
+        $this->assertNull($resolution->getOrder(), 'An unverified webhook must not resolve an order.');
+    }
+
     private function subject(): StripePaymentMethod
     {
         return new StripePaymentMethod(
             $this->configurationFactory(),
             new StripeClientFactory(),
             $this->get(\Psr\EventDispatcher\EventDispatcherInterface::class),
+            $this->get(OrderRepository::class),
             new NullLogger(),
         );
     }
@@ -138,6 +193,9 @@ final class StripePaymentMethodTest extends AbstractStripeMockTestCase
                         'object' => 'checkout.session',
                         'payment_status' => 'paid',
                         'payment_intent' => 'pi_test_1',
+                        'client_reference_id' => '42',
+                        'amount_total' => 1234,
+                        'currency' => 'eur',
                     ],
                 ],
             ],
@@ -165,7 +223,10 @@ final class StripePaymentMethodTest extends AbstractStripeMockTestCase
     private function order(): Order
     {
         $order = new Order();
+        $order->_setProperty('uid', 42);
         $order->setOrderNumber('ORD-1');
+        $order->setCurrency('EUR');
+        $order->setTotalGross(Money::fromCents(1234));
 
         return $order;
     }
