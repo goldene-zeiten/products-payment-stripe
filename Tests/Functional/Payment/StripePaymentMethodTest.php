@@ -22,6 +22,7 @@ use Psr\Log\NullLogger;
 use TYPO3\CMS\Core\Configuration\ExtensionConfiguration;
 use TYPO3\CMS\Core\Http\ServerRequest;
 use TYPO3\CMS\Core\Http\Stream;
+use TYPO3\CMS\Core\Site\Entity\Site;
 
 final class StripePaymentMethodTest extends AbstractStripeMockTestCase
 {
@@ -72,6 +73,19 @@ final class StripePaymentMethodTest extends AbstractStripeMockTestCase
         $result = $this->subject()->handleReturn($this->returnRequest('cs_test_unpaid'), $this->order());
 
         $this->assertSame(PaymentResultState::FAILED, $result->getState());
+    }
+
+    /**
+     * Asynchronous methods (SEPA debit, bank transfers) complete the checkout before the money arrives; the
+     * order is accepted with the payment pending rather than cancelled as unpaid.
+     */
+    #[Test]
+    public function handleReturnReportsACompletedSessionAwaitingAnAsyncPaymentAsPending(): void
+    {
+        $result = $this->subject()->handleReturn($this->returnRequest('cs_test_async'), $this->order());
+
+        $this->assertSame(PaymentResultState::PENDING, $result->getState());
+        $this->assertSame('pi_test_async', $result->getExternalId());
     }
 
     #[Test]
@@ -143,6 +157,57 @@ final class StripePaymentMethodTest extends AbstractStripeMockTestCase
     }
 
     #[Test]
+    public function handleStaticWebhookReportsACompletedSessionAwaitingAnAsyncPaymentAsPending(): void
+    {
+        $this->importCSVDataSet(__DIR__ . '/../Fixtures/order_for_webhook.csv');
+
+        $resolution = $this->subject()->handleStaticWebhook($this->webhookRequest(true, 'checkout.session.completed', 'unpaid'));
+
+        $this->assertSame(42, $resolution->getOrder()?->getUid());
+        $this->assertSame(PaymentResultState::PENDING, $resolution->getResult()->getState());
+    }
+
+    #[Test]
+    public function handleStaticWebhookMarksPaidOnceAnAsyncPaymentSucceeds(): void
+    {
+        $this->importCSVDataSet(__DIR__ . '/../Fixtures/order_for_webhook.csv');
+
+        $resolution = $this->subject()->handleStaticWebhook($this->webhookRequest(true, 'checkout.session.async_payment_succeeded'));
+
+        $this->assertSame(42, $resolution->getOrder()?->getUid());
+        $this->assertSame(PaymentStatus::PAID, $resolution->getResult()->getPaymentStatus());
+    }
+
+    #[Test]
+    public function handleStaticWebhookFailsWhenAnAsyncPaymentFails(): void
+    {
+        $this->importCSVDataSet(__DIR__ . '/../Fixtures/order_for_webhook.csv');
+
+        $resolution = $this->subject()->handleStaticWebhook($this->webhookRequest(true, 'checkout.session.async_payment_failed', 'unpaid'));
+
+        $this->assertSame(42, $resolution->getOrder()?->getUid());
+        $this->assertSame(PaymentResultState::FAILED, $resolution->getResult()->getState());
+    }
+
+    #[Test]
+    public function handleStaticWebhookAcknowledgesAnEventTypeItDoesNotHandle(): void
+    {
+        $this->importCSVDataSet(__DIR__ . '/../Fixtures/order_for_webhook.csv');
+
+        $resolution = $this->subject()->handleStaticWebhook($this->webhookRequest(true, 'payment_intent.created'));
+
+        $this->assertTrue($resolution->isIgnored());
+    }
+
+    #[Test]
+    public function handleWebhookLeavesThePaymentUnchangedForAnEventTypeItDoesNotHandle(): void
+    {
+        $result = $this->subject()->handleWebhook($this->webhookRequest(true, 'payment_intent.created'), $this->order());
+
+        $this->assertSame(PaymentResultState::UNCHANGED, $result->getState());
+    }
+
+    #[Test]
     public function handleStaticWebhookRejectsAnInvalidSignature(): void
     {
         $this->importCSVDataSet(__DIR__ . '/../Fixtures/order_for_webhook.csv');
@@ -150,6 +215,58 @@ final class StripePaymentMethodTest extends AbstractStripeMockTestCase
         $resolution = $this->subject()->handleStaticWebhook($this->webhookRequest(false));
 
         $this->assertNull($resolution->getOrder(), 'An unverified webhook must not resolve an order.');
+    }
+
+    /**
+     * Gateway callbacks run as middlewares before the page is resolved, where core has not published the
+     * request globally yet. Credentials configured only on the site must still be found - from the site of
+     * the callback request itself.
+     */
+    #[Test]
+    public function handleStaticWebhookUsesTheCredentialsOfTheRequestsSite(): void
+    {
+        $this->importCSVDataSet(__DIR__ . '/../Fixtures/order_for_webhook.csv');
+        $subject = new StripePaymentMethod(
+            new StripeConfigurationFactory($this->siteOnlyConfiguration(), new CurrentSiteResolver()),
+            new StripeClientFactory(),
+            $this->get(\Psr\EventDispatcher\EventDispatcherInterface::class),
+            $this->get(OrderRepository::class),
+            new NullLogger(),
+        );
+
+        $resolution = $subject->handleStaticWebhook($this->siteOnlyRequest($this->webhookRequest(true)));
+
+        $this->assertSame(42, $resolution->getOrder()?->getUid());
+        $this->assertSame(PaymentStatus::PAID, $resolution->getResult()->getPaymentStatus());
+    }
+
+    private function siteOnlyRequest(ServerRequestInterface $request): ServerRequestInterface
+    {
+        unset($GLOBALS['TYPO3_REQUEST']);
+        $site = new Site('shop', 1, [
+            'base' => 'https://shop.example/',
+            'settings' => [
+                'products' => [
+                    'payment' => [
+                        'stripe' => [
+                            'secretKey' => 'sk_test_x',
+                            'webhookSecret' => 'whsec_test',
+                            'apiBaseUrl' => $this->mockRoot . '/payment/stripe',
+                        ],
+                    ],
+                ],
+            ],
+        ]);
+
+        return $request->withAttribute('site', $site);
+    }
+
+    private function siteOnlyConfiguration(): ApiSettingsResolver
+    {
+        $extensionConfiguration = $this->createMock(ExtensionConfiguration::class);
+        $extensionConfiguration->method('get')->willReturn([]);
+
+        return new ApiSettingsResolver($extensionConfiguration);
     }
 
     private function subject(): StripePaymentMethod
@@ -180,18 +297,19 @@ final class StripePaymentMethodTest extends AbstractStripeMockTestCase
         return (new ServerRequest('https://shop.example/return', 'GET'))->withQueryParams(['session_id' => $sessionId]);
     }
 
-    private function webhookRequest(bool $validSignature): ServerRequestInterface
+    private function webhookRequest(bool $validSignature, string $type = 'checkout.session.completed', string $paymentStatus = 'paid'): ServerRequestInterface
     {
         $payload = json_encode(
             [
                 'id' => 'evt_1',
                 'object' => 'event',
-                'type' => 'checkout.session.completed',
+                'type' => $type,
                 'data' => [
                     'object' => [
                         'id' => 'cs_test_1',
                         'object' => 'checkout.session',
-                        'payment_status' => 'paid',
+                        'status' => 'complete',
+                        'payment_status' => $paymentStatus,
                         'payment_intent' => 'pi_test_1',
                         'client_reference_id' => '42',
                         'amount_total' => 1234,
